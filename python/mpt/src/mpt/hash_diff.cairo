@@ -101,9 +101,24 @@ func hash_state_account_diff{poseidon_ptr: PoseidonBuiltin*}(state: State) -> fe
     // We cast the state dict pointer to an AddressAccountDiffEntry pointer as the two underlying types are identical.
     let casted_dict_ptr_start = cast(dict_ptr_start, AddressAccountDiffEntryStruct*);
     let accumulator = poseidon_account_diff(AddressAccountDiffEntry(casted_dict_ptr_start));
-    tempvar start_ptr = new AddressAccountDiffEntry(casted_dict_ptr_start);
-    let final_hash = _hash_account_diff_inner(accumulator, start_ptr, 1, len);
+    let final_hash = _hash_state_account_diff_inner(accumulator, casted_dict_ptr_start, 1, len);
     return final_hash;
+}
+
+func _hash_state_account_diff_inner{poseidon_ptr: PoseidonBuiltin*}(
+    accumulator: felt, start_ptr: AddressAccountDiffEntryStruct*, i: felt, len: felt
+) -> felt {
+    if (i == len) {
+        return accumulator;
+    }
+    let next_hash = poseidon_account_diff(AddressAccountDiffEntry(start_ptr + i));
+
+    let (buffer) = alloc();
+    assert buffer[0] = accumulator;
+    assert buffer[1] = next_hash;
+    let (accumulator) = poseidon_hash_many(2, buffer);
+
+    return _hash_state_account_diff_inner(accumulator, start_ptr, i + 1, len);
 }
 
 func hash_storage_diff_segment{poseidon_ptr: PoseidonBuiltin*}(storage_diff: StorageDiff) -> felt {
@@ -148,8 +163,23 @@ func hash_state_storage_diff{poseidon_ptr: PoseidonBuiltin*}(state: State) -> fe
     let casted_dict_ptr_start = cast(dict_ptr_start, StorageDiffEntryStruct*);
 
     let accumulator = poseidon_storage_diff(StorageDiffEntry(casted_dict_ptr_start));
-    tempvar start_ptr = new StorageDiffEntry(casted_dict_ptr_start);
-    let final_hash = _hash_storage_diff_inner(accumulator, start_ptr, 1, len);
+    let final_hash = _hash_state_storage_diff_inner(accumulator, casted_dict_ptr_start, 1, len);
 
     return final_hash;
+}
+
+func _hash_state_storage_diff_inner{poseidon_ptr: PoseidonBuiltin*}(
+    accumulator: felt, start_ptr: StorageDiffEntryStruct*, i: felt, len: felt
+) -> felt {
+    if (i == len) {
+        return accumulator;
+    }
+    let next_hash = poseidon_storage_diff(StorageDiffEntry(start_ptr + i));
+
+    let (buffer) = alloc();
+    assert buffer[0] = accumulator;
+    assert buffer[1] = next_hash;
+    let (accumulator) = poseidon_hash_many(2, buffer);
+
+    return _hash_state_storage_diff_inner(accumulator, start_ptr, i + 1, len);
 }
