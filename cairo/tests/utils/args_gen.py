@@ -124,6 +124,7 @@ from ethereum_types.bytes import (
 )
 from ethereum_types.frozen import slotted_freezable
 from ethereum_types.numeric import U64, U256, FixedUnsigned, Uint, _max_value
+from py_ecc.bls.typing import G1Uncompressed
 from py_ecc.fields import optimized_bls12_381_FQ as BLSF
 from py_ecc.fields import optimized_bls12_381_FQ2 as BLSF2
 from py_ecc.typing import Optimized_Point3D
@@ -204,6 +205,12 @@ class U384(FixedUnsigned):
 
 
 U384.MAX_VALUE = _max_value(U384, 384)
+
+
+# In EELS, this is a NewType of int.
+# Which cannot be found by isinstance(instance, G1Compressed)
+class G1Compressed(int):
+    pass
 
 
 class Memory(bytearray):
@@ -922,6 +929,8 @@ _cairo_struct_to_python_type: Dict[Tuple[str, ...], Any] = {
     ("ethereum", "crypto", "kzg", "KZGCommitment"): KZGCommitment,
     ("ethereum", "crypto", "bls12_381", "BLSP"): Optimized_Point3D[BLSF],
     ("ethereum", "crypto", "bls12_381", "BLSP2"): Optimized_Point3D[BLSF2],
+    ("ethereum", "crypto", "bls12_381", "G1Compressed"): G1Compressed,
+    ("ethereum", "crypto", "bls12_381", "G1Uncompressed"): G1Uncompressed,
 }
 
 # In the EELS, some functions are annotated with Sequence while it's actually just Bytes.
@@ -1251,9 +1260,12 @@ def _gen_arg(
         segments.load_data(base, felt_values)
         return base
 
-    if arg_type in (U384, Bytes48, KZGCommitment):
+    if arg_type in (U384, G1Compressed, Bytes48, KZGCommitment):
         if isinstance_with_generic(arg, U384):
             arg = arg.to_le_bytes()
+        elif isinstance_with_generic(arg, G1Compressed):
+            arg = U384(arg).to_le_bytes()
+
         felt_values = [
             int.from_bytes(arg[i : i + 12], "little") for i in range(0, 48, 12)
         ]

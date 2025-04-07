@@ -64,6 +64,7 @@ from py_ecc.bls.hash_to_curve import (
     map_to_curve_G1,
     map_to_curve_G2,
 )
+from py_ecc.bls.point_compression import compress_G1
 from py_ecc.fields import optimized_bls12_381_FQ as BLSF
 from py_ecc.fields import optimized_bls12_381_FQ2 as BLSF2
 from py_ecc.optimized_bls12_381.optimized_pairing import normalize1
@@ -80,6 +81,7 @@ from tests.utils.args_gen import (  # noqa
     Account,
     Environment,
     Evm,
+    G1Compressed,
     Memory,
     Message,
     MutableBloom,
@@ -257,6 +259,8 @@ blsp_strategy = blsf_strategy.map(lambda x: map_to_curve_G1(x)).map(
 blsp2_strategy = blsf2_strategy.map(lambda x: map_to_curve_G2(x)).map(
     lambda x: normalize1(x)
 )
+
+blsG1_compressed = blsp_strategy.map(compress_G1).map(G1Compressed)
 
 
 def tuple_strategy(thing):
@@ -817,3 +821,4 @@ def register_type_strategies():
     st.register_type_strategy(BLSF2, blsf2_strategy)
     st.register_type_strategy(KZGCommitment, bytes48.map(KZGCommitment))
     st.register_type_strategy(Bytes48, bytes48)
+    st.register_type_strategy(G1Compressed, blsG1_compressed)
