@@ -312,7 +312,7 @@ class Account:
             if field.name != "storage_root"
         )
 
-    def hash_args(self) -> List[int]:
+    def hash_args(self, with_storage_root: bool = True) -> List[int]:
         """
         Returns the list of arguments used when hashing the account.
         """
@@ -320,7 +320,11 @@ class Account:
             int(self.nonce),
             *int_to_uint256(int(self.balance)),
             *int_to_uint256(int.from_bytes(self.code_hash, "little")),
-            *int_to_uint256(int.from_bytes(self.storage_root, "little")),
+            *(
+                int_to_uint256(int.from_bytes(self.storage_root, "little"))
+                if with_storage_root
+                else []
+            ),
         ]
 
     @staticmethod
@@ -533,7 +537,8 @@ class AddressAccountDiffEntry:
             [
                 int.from_bytes(self.key, "little"),
                 *self.prev_value.hash_args(),
-                *self.new_value.hash_args(),
+                # We don't hash the new storage_root we can't compute it from the partial state changes
+                *self.new_value.hash_args(with_storage_root=False),
             ]
         )
 
