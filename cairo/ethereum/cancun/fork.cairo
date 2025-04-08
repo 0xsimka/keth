@@ -110,6 +110,7 @@ from ethereum.cancun.state import (
     destroy_account,
     destroy_touched_empty_accounts,
     get_account,
+    get_account_code,
     increment_nonce,
     set_account_balance,
     State,
@@ -118,6 +119,7 @@ from ethereum.cancun.state import (
     empty_transient_storage,
     process_withdrawal,
     state_root,
+    finalize_state,
 )
 from ethereum.cancun.transactions_types import (
     TX_ACCESS_LIST_ADDRESS_COST,
@@ -833,7 +835,7 @@ func check_transaction{
     }
 
     // Empty code check for EOA
-    let sender_code = sender_account.value.code;
+    let sender_code = get_account_code{state=state}(sender_address, sender_account);
     with_attr error_message("InvalidBlock") {
         assert sender_code.value.len = 0;
     }
@@ -1036,7 +1038,9 @@ func apply_body{
 
     tempvar beacon_roots_address = Address(BEACON_ROOTS_ADDRESS);
     let beacon_roots_account = get_account(beacon_roots_address);
-    let beacon_block_roots_contract_code = beacon_roots_account.value.code;
+    let beacon_block_roots_contract_code = get_account_code{state=state}(
+        beacon_roots_address, beacon_roots_account
+    );
 
     let data = Bytes32_to_Bytes(parent_beacon_block_root);
     let code_address = OptionalAddress(&beacon_roots_address);
@@ -1176,6 +1180,9 @@ func apply_body{
         ),
     );
     let withdrawals_root = root(withdrawals_eth_trie, none_storage_roots);
+
+    // Finalize the state, getting unique keys for main and storage tries
+    finalize_state{state=state}();
 
     let state_root_ = state_root(state);
 

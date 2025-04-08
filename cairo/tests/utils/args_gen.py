@@ -53,7 +53,7 @@ import functools
 import inspect
 import sys
 from collections import ChainMap, abc, defaultdict
-from dataclasses import dataclass, field, fields, is_dataclass, make_dataclass
+from dataclasses import dataclass, fields, is_dataclass, make_dataclass
 from functools import partial
 from typing import (
     Annotated,
@@ -77,7 +77,6 @@ from typing import (
 
 from ethereum.cancun.blocks import Block, Header, Log, Receipt, Withdrawal
 from ethereum.cancun.fork import ApplyBodyOutput, BlockChain
-from ethereum.cancun.fork_types import Account as AccountBase
 from ethereum.cancun.fork_types import (
     Address,
     Bloom,
@@ -108,8 +107,9 @@ from ethereum.cancun.vm.gas import ExtendMemory, MessageCallGas
 from ethereum.cancun.vm.interpreter import MessageCallOutput as MessageCallOutputBase
 from ethereum.crypto.alt_bn128 import BNF, BNF2, BNF12, BNP, BNP2, BNP12
 from ethereum.crypto.hash import Hash32
-from ethereum.crypto.kzg import BLSFieldElement
+from ethereum.crypto.kzg import BLSFieldElement, KZGCommitment
 from ethereum.exceptions import EthereumException
+from ethereum_rlp import rlp
 from ethereum_rlp.rlp import Extended, Simple
 from ethereum_types.bytes import (
     Bytes,
@@ -119,10 +119,14 @@ from ethereum_types.bytes import (
     Bytes8,
     Bytes20,
     Bytes32,
+    Bytes48,
     Bytes256,
 )
 from ethereum_types.frozen import slotted_freezable
 from ethereum_types.numeric import U64, U256, FixedUnsigned, Uint, _max_value
+from py_ecc.fields import optimized_bls12_381_FQ as BLSF
+from py_ecc.fields import optimized_bls12_381_FQ2 as BLSF2
+from py_ecc.typing import Optimized_Point3D
 from starkware.cairo.common.dict import DictManager, DictTracker
 from starkware.cairo.lang.cairo_constants import DEFAULT_PRIME
 from starkware.cairo.lang.compiler.ast.cairo_types import (
@@ -141,11 +145,12 @@ from starkware.cairo.lang.vm.crypto import poseidon_hash_many
 from starkware.cairo.lang.vm.memory_segments import MemorySegmentManager
 from starkware.cairo.lang.vm.relocatable import RelocatableValue
 
+from cairo_addons.utils.uint256 import int_to_uint256
 from cairo_addons.vm import DictTracker as RustDictTracker
 from cairo_addons.vm import MemorySegmentManager as RustMemorySegmentManager
 from cairo_addons.vm import Relocatable as RustRelocatable
 from cairo_ec.curve import ECBase
-from mpt.utils import AccountNode
+from mpt.ethereum_tries import EMPTY_BYTES_HASH, EMPTY_TRIE_HASH
 from tests.utils.helpers import flatten
 
 HASHED_TYPES = [
@@ -288,24 +293,16 @@ class Message(
         return common_fields and self.parent_evm == other.parent_evm
 
 
-EMPTY_STORAGE_ROOT = Bytes32(
-    (0x56E81F171BCC55A6FF8345E692C0F86E5B48E01B996CADC001622FB5E363B421).to_bytes(
-        32, "big"
-    )
-)
-
-# Separate setup & class definition to apply freezable decorator
-AccountDataclass = make_dataclass(
-    "AccountDataclass",
-    [(f.name, f.type, f) for f in fields(AccountBase)]
-    + [("storage_root", Bytes32, field(default=EMPTY_STORAGE_ROOT))],
-    namespace={"__doc__": AccountBase.__doc__},
-)
-
-
 @slotted_freezable
 @dataclass
-class Account(AccountDataclass):
+class Account:
+    # Order of fields is important regarding serde logic
+    nonce: Uint
+    balance: U256
+    code_hash: Hash32
+    storage_root: Hash32
+    code: bytes
+
     def __eq__(self, other):
         if not isinstance(other, Account):
             return False
@@ -315,9 +312,89 @@ class Account(AccountDataclass):
             if field.name != "storage_root"
         )
 
+    def hash_args(self) -> List[int]:
+        """
+        Returns the list of arguments used when hashing the account.
+        """
+        return [
+            int(self.nonce),
+            *int_to_uint256(int(self.balance)),
+            *int_to_uint256(int.from_bytes(self.code_hash, "little")),
+            *int_to_uint256(int.from_bytes(self.storage_root, "little")),
+        ]
+
+    @staticmethod
+    def from_rlp(bytes: Bytes) -> "Account":
+        """
+        Decode the RLP encoded representation of an account.
+        Because the RLP encoding does not contain the code, it is initially None.
+        """
+        decoded = rlp.decode(bytes)
+        return Account(
+            nonce=Uint(int.from_bytes(decoded[0], "big")),
+            balance=U256(int.from_bytes(decoded[1], "big")),
+            storage_root=Hash32(decoded[2]),
+            code_hash=Hash32(decoded[3]),
+            code=None,
+        )
+
+    def to_rlp(self) -> Bytes:
+        """
+        Encode the account as RLP.
+        """
+        nonce_bytes = (
+            self.nonce._number.to_bytes(
+                (self.nonce._number.bit_length() + 7) // 8, "big"
+            )
+            or b"\x00"
+        )
+        balance_bytes = self.balance._number.to_bytes(32, "big")
+        balance_bytes = balance_bytes.lstrip(b"\x00") or b"\x00"
+
+        encoded = rlp.encode(
+            [
+                nonce_bytes,
+                balance_bytes,
+                self.storage_root,
+                self.code_hash,
+            ]
+        )
+        return encoded
+
+
+def encode_account(raw_account_data: Account, storage_root: Bytes) -> Bytes:
+    from ethereum_rlp import rlp
+
+    return rlp.encode(
+        (
+            raw_account_data.nonce,
+            raw_account_data.balance,
+            storage_root,
+            # Modified to use code_hash instead of hash(code)
+            raw_account_data.code_hash,
+        )
+    )
+
+
+def set_code(state: State, address: Address, code: Bytes) -> None:
+    from ethereum.cancun.state import modify_state
+
+    def write_code(sender: Account) -> None:
+        from ethereum.crypto.hash import keccak256
+
+        sender.code = code
+        # Modified to set the code hash as well
+        sender.code_hash = keccak256(code)
+
+    modify_state(state, address, write_code)
+
 
 EMPTY_ACCOUNT = Account(
-    nonce=Uint(0), balance=U256(0), code=b"", storage_root=EMPTY_STORAGE_ROOT
+    nonce=Uint(0),
+    balance=U256(0),
+    code=b"",
+    storage_root=EMPTY_TRIE_HASH,
+    code_hash=EMPTY_BYTES_HASH,
 )
 
 
@@ -446,17 +523,35 @@ class FlatState:
 
 
 @dataclass
-class AddressAccountNodeDiffEntry:
+class AddressAccountDiffEntry:
     key: Address
-    prev_value: AccountNode
-    new_value: AccountNode
+    prev_value: Account
+    new_value: Account
+
+    def hash_poseidon(self):
+        return poseidon_hash_many(
+            [
+                int.from_bytes(self.key, "little"),
+                *self.prev_value.hash_args(),
+                *self.new_value.hash_args(),
+            ]
+        )
 
 
 @dataclass
 class StorageDiffEntry:
-    key: int
+    key: Uint
     prev_value: U256
     new_value: U256
+
+    def hash_poseidon(self):
+        return poseidon_hash_many(
+            [
+                int(self.key),
+                *int_to_uint256(int(self.prev_value)),
+                *int_to_uint256(int(self.new_value)),
+            ]
+        )
 
 
 @dataclass
@@ -585,15 +680,18 @@ _cairo_struct_to_python_type: Dict[Tuple[str, ...], Any] = {
     ("cairo_core", "numeric", "SetUint"): Set[Uint],
     ("cairo_core", "numeric", "UnionUintU256"): Union[Uint, U256],
     ("cairo_core", "numeric", "U384"): U384,
+    ("cairo_core", "numeric", "OptionalU384"): Optional[U384],
     ("cairo_core", "bytes", "Bytes0"): Bytes0,
     ("cairo_core", "bytes", "Bytes1"): Bytes1,
     ("cairo_core", "bytes", "Bytes4"): Bytes4,
     ("cairo_core", "bytes", "Bytes8"): Bytes8,
     ("cairo_core", "bytes", "Bytes20"): Bytes20,
     ("cairo_core", "bytes", "Bytes32"): Bytes32,
+    ("cairo_core", "bytes", "Bytes48"): Bytes48,
     ("cairo_core", "bytes", "TupleBytes32"): Tuple[Bytes32, ...],
     ("cairo_core", "bytes", "Bytes256"): Bytes256,
     ("cairo_core", "bytes", "Bytes"): Bytes,
+    ("cairo_core", "bytes", "OptionalBytes"): Optional[Bytes],
     ("cairo_core", "bytes", "String"): str,
     ("cairo_core", "bytes", "TupleBytes"): Tuple[Bytes, ...],
     ("cairo_core", "bytes", "MappingBytesBytes"): Mapping[Bytes, Bytes],
@@ -805,21 +903,25 @@ _cairo_struct_to_python_type: Dict[Tuple[str, ...], Any] = {
     ("ethereum", "crypto", "alt_bn128", "BNP"): BNP,
     ("ethereum", "crypto", "alt_bn128", "BNF"): BNF,
     ("ethereum", "crypto", "alt_bn128", "BNP2"): BNP2,
-    ("mpt", "trie_diff", "MappingBytes32Address"): Mapping[Bytes32, Address],
-    ("mpt", "trie_diff", "MappingBytes32Bytes32"): Mapping[Bytes32, Bytes32],
-    ("mpt", "trie_diff", "AccountNode"): AccountNode,
-    ("mpt", "trie_diff", "NodeStore"): Mapping[Hash32, Optional[InternalNode]],
+    ("mpt", "types", "MappingBytes32Address"): Mapping[Bytes32, Address],
+    ("mpt", "types", "MappingBytes32Bytes32"): Mapping[Bytes32, Bytes32],
+    ("mpt", "types", "NodeStore"): Mapping[Hash32, Optional[InternalNode]],
     ("cairo_core", "bytes", "HashedBytes32"): int,
-    ("mpt", "trie_diff", "UnionInternalNodeExtended"): Union[InternalNode, Extended],
-    ("mpt", "trie_diff", "OptionalUnionInternalNodeExtended"): Optional[
+    ("mpt", "types", "UnionInternalNodeExtended"): Union[InternalNode, Extended],
+    ("mpt", "types", "OptionalUnionInternalNodeExtended"): Optional[
         Union[InternalNode, Extended]
     ],
-    ("mpt", "trie_diff", "AddressAccountNodeDiffEntry"): AddressAccountNodeDiffEntry,
-    ("mpt", "trie_diff", "AccountDiff"): List[AddressAccountNodeDiffEntry],
-    ("mpt", "trie_diff", "StorageDiffEntry"): StorageDiffEntry,
-    ("mpt", "trie_diff", "StorageDiff"): List[StorageDiffEntry],
+    ("mpt", "types", "AddressAccountDiffEntry"): AddressAccountDiffEntry,
+    ("mpt", "types", "AccountDiff"): List[AddressAccountDiffEntry],
+    ("mpt", "types", "StorageDiffEntry"): StorageDiffEntry,
+    ("mpt", "types", "StorageDiff"): List[StorageDiffEntry],
     ("ethereum", "cancun", "fork_types", "HashedTupleAddressBytes32"): Uint,
     ("ethereum", "crypto", "kzg", "BLSScalar"): BLSFieldElement,
+    ("ethereum", "crypto", "bls12_381", "BLSF"): BLSF,
+    ("ethereum", "crypto", "bls12_381", "BLSF2"): BLSF2,
+    ("ethereum", "crypto", "kzg", "KZGCommitment"): KZGCommitment,
+    ("ethereum", "crypto", "bls12_381", "BLSP"): Optimized_Point3D[BLSF],
+    ("ethereum", "crypto", "bls12_381", "BLSP2"): Optimized_Point3D[BLSF2],
 }
 
 # In the EELS, some functions are annotated with Sequence while it's actually just Bytes.
@@ -1019,6 +1121,12 @@ def _gen_arg(
         if arg_type_origin is tuple and (
             Ellipsis not in get_args(arg_type) or annotations
         ):
+            # Handle conversion from Optimized_Point3D to Optimized_Point2D for BLS12-381
+
+            if arg_type in (Optimized_Point3D[BLSF], Optimized_Point3D[BLSF2]):
+                assert arg[2] == type(arg[2]).one()
+                arg = (arg[0], arg[1])
+
             # Case a tuple with a fixed number of elements, all of different types.
             # These are represented as a pointer to a struct with a pointer to each element.
             element_types = get_args(arg_type)
@@ -1143,25 +1251,30 @@ def _gen_arg(
         segments.load_data(base, felt_values)
         return base
 
-    if arg_type is U384:
-        bytes_value = arg.to_le_bytes()
+    if arg_type in (U384, Bytes48, KZGCommitment):
+        if isinstance_with_generic(arg, U384):
+            arg = arg.to_le_bytes()
         felt_values = [
-            int.from_bytes(bytes_value[i : i + 12], "little") for i in range(0, 48, 12)
+            int.from_bytes(arg[i : i + 12], "little") for i in range(0, 48, 12)
         ]
 
         base = segments.add()
         segments.load_data(base, felt_values)
         return base
 
-    if arg_type is BNF:
+    if arg_type in (BNF, BLSF):
         base = segments.add()
         coeff = [_gen_arg(dict_manager, segments, U384, U384(arg))]
         segments.load_data(base, coeff)
         return base
 
-    if arg_type in (BNF2, BNF12):
+    if arg_type in (BNF2, BNF12, BLSF2):
         base = segments.add()
-        # In python, BNF<N> is a tuple of N int but in cairo it's a struct with N U384
+        # In python, BNF<N> is a raw tuple of N int.
+        # In python, BLSF<N> stores this tuple in a field "coeffs".
+        if arg_type == BLSF2:
+            arg = arg.coeffs
+        # In Cairo, BNF<N> and BLSF<N> are a struct of N U384.
         # Cast int to U384 to be able to serialize
         coeffs = [
             _gen_arg(dict_manager, segments, U384, U384(arg[i]))

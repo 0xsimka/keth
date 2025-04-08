@@ -53,7 +53,7 @@ cairo-ec = { workspace = true }
 cairo-core = { workspace = true }
 eth-rpc = { workspace = true }
 mpt = { workspace = true }
-garaga-zero = { git = "https://github.com/kkrt-labs/garaga-zero" }
+garaga-zero = { git = "https://github.com/kkrt-labs/garaga-zero", rev = "c01503e804c36ab71d5aa46acb676603e79f5204" }
 
 [tool.uv.workspace]
 members = ["python/*"]
@@ -213,7 +213,6 @@ packages = ["cairo/src", "cairo/tests", "cairo/scripts"]
 [project.scripts]
 compile = "scripts.compile_cairo:main"
 compile_keth = "scripts.compile_cairo:compile_keth"
-zkpi_to_eels = "scripts.zkpi_to_eels:main"
 prove-block = "scripts.prove_block:main"
 test-fast = "scripts.test:test_fast"
 test-unit = "scripts.test:test_unit"

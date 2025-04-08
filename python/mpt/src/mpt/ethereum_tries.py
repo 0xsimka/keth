@@ -3,9 +3,9 @@ import logging
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping
 
-from ethereum.cancun.fork_types import Address
+from ethereum.cancun.fork_types import Account, Address
 from ethereum.cancun.state import State, set_account, set_storage
 from ethereum.cancun.trie import (
     BranchNode,
@@ -18,8 +18,7 @@ from ethereum_rlp import rlp
 from ethereum_types.bytes import Bytes, Bytes20, Bytes32
 from ethereum_types.numeric import U256
 
-from eth_rpc import EthereumRPC
-from mpt.utils import AccountNode, decode_node, nibble_list_to_bytes
+from mpt.utils import decode_node, nibble_list_to_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -51,28 +50,15 @@ class EthereumTries:
     storage_key_preimages: Mapping[Hash32, Bytes32]
     state_root: Hash32
 
-    # TODO: remove
-    # Currently, zkpi does not provide codes of accounts touched only by EXTCODEHASH during a block
-    # execution. As such, we fallback on an RPC client to fetch missing codes.
-    rpc_client: Optional[EthereumRPC] = None
-
-    def get_code(self, code_hash: Hash32, address: Address) -> Bytes:
+    def get_code(self, code_hash: Hash32) -> Bytes:
         """
         Get the code corresponding to the given code hash.
-        If no code is found, we fallback on an RPC client to fetch the code.
+        If no code is found, it means the code is not required for block execution.
         """
         if code_hash == EMPTY_BYTES_HASH:
             return b""
 
         code = self.codes.get(code_hash)
-        if code is not None:
-            return code
-
-        if self.rpc_client is None:
-            self.rpc_client = EthereumRPC.from_env()
-
-        code = self.rpc_client.get_code(address)
-        self.codes[code_hash] = code
         return code
 
     @staticmethod
@@ -238,17 +224,24 @@ class EthereumTries:
         if address is None:
             return
 
-        account_node = AccountNode.from_rlp(node.value)
-        account_code = self.get_code(account_node.code_hash, address)
-        account = account_node.to_eels_account(account_code)
+        # RLP-decode the account, then get the code matching the code hash.
+        account_without_code = Account.from_rlp(node.value)
+        account_code = self.get_code(account_without_code.code_hash)
+        account = Account(
+            nonce=account_without_code.nonce,
+            balance=account_without_code.balance,
+            code_hash=account_without_code.code_hash,
+            storage_root=account_without_code.storage_root,
+            code=account_code,
+        )
 
         set_account(state, address, account)
 
-        if account_node.storage_root == EMPTY_TRIE_HASH:
+        if account.storage_root == EMPTY_TRIE_HASH:
             return
 
         # We need to resolve the storage root of the account
-        storage_root_node = self.nodes.get(account_node.storage_root)
+        storage_root_node = self.nodes.get(account.storage_root)
         if storage_root_node is None:
             return
 

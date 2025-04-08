@@ -29,6 +29,7 @@ from ethereum.cancun.trie import (
     LeafNode,
     Trie,
     copy_trie,
+    encode_internal_node,
 )
 from ethereum.cancun.trie import root as compute_root
 from ethereum.cancun.vm import Environment, Evm, Message
@@ -44,8 +45,8 @@ from ethereum.crypto.alt_bn128 import (
 )
 from ethereum.crypto.elliptic_curve import SECP256K1N
 from ethereum.crypto.finite_field import GaloisField
-from ethereum.crypto.hash import Hash32
-from ethereum.crypto.kzg import BLSFieldElement
+from ethereum.crypto.hash import Hash32, keccak256
+from ethereum.crypto.kzg import BLSFieldElement, KZGCommitment
 from ethereum.exceptions import EthereumException
 from ethereum_types.bytes import (
     Bytes0,
@@ -53,19 +54,28 @@ from ethereum_types.bytes import (
     Bytes8,
     Bytes20,
     Bytes32,
+    Bytes48,
     Bytes64,
     Bytes256,
 )
 from ethereum_types.numeric import U64, U256, FixedUnsigned, Uint
 from hypothesis import strategies as st
+from py_ecc.bls.hash_to_curve import (
+    map_to_curve_G1,
+    map_to_curve_G2,
+)
+from py_ecc.fields import optimized_bls12_381_FQ as BLSF
+from py_ecc.fields import optimized_bls12_381_FQ2 as BLSF2
+from py_ecc.optimized_bls12_381.optimized_pairing import normalize1
 from starkware.cairo.lang.cairo_constants import DEFAULT_PRIME
 
 from cairo_ec.curve import AltBn128
+from mpt.ethereum_tries import EMPTY_BYTES_HASH
 
 # Note: I have noticed that even if we patch the imports in conftests.py, because hypothesis runs before these patches are applied,
 # this file would still be working with the old types. Thus, we _explicitly_ import our patched types from args_gen.py here.
 from tests.utils.args_gen import (  # noqa
-    EMPTY_STORAGE_ROOT,
+    EMPTY_TRIE_HASH,
     U384,
     Account,
     Environment,
@@ -231,6 +241,24 @@ class TypedTuple(tuple, Generic[T1, T2]):
         return super(TypedTuple, cls).__new__(cls, values)
 
 
+blsf_strategy = st.builds(
+    BLSF, st.integers(min_value=0, max_value=BLSF.field_modulus - 1)
+)
+blsf2_strategy = st.builds(
+    BLSF2,
+    st.tuples(
+        st.integers(min_value=0, max_value=BLSF2.field_modulus - 1),
+        st.integers(min_value=0, max_value=BLSF2.field_modulus - 1),
+    ),
+)
+blsp_strategy = blsf_strategy.map(lambda x: map_to_curve_G1(x)).map(
+    lambda x: normalize1(x)
+)
+blsp2_strategy = blsf2_strategy.map(lambda x: map_to_curve_G2(x)).map(
+    lambda x: normalize1(x)
+)
+
+
 def tuple_strategy(thing):
     types = thing.__args__
 
@@ -241,6 +269,12 @@ def tuple_strategy(thing):
             .map(tuple)
             .map(lambda x: TypedTuple[types](x))
         )
+
+    # Handle py_ecc Optimized_Point3D (tuples of BLSF or BLSF2)
+    if types[0] == BLSF:
+        return blsp_strategy
+    if types[0] == BLSF2:
+        return blsp2_strategy
 
     return st.tuples(*(st.from_type(t) for t in types)).map(
         lambda x: TypedTuple[types](x)
@@ -428,13 +462,29 @@ evm = st.builds(
 )
 
 
-# Take the EMPTY_STORAGE_ROOT value by default. This will be built in the state strategy, based on the storage tries.
-account_strategy = st.builds(
-    Account,
-    nonce=uint,
-    balance=uint256,
-    code=code,
-    storage_root=st.just(EMPTY_STORAGE_ROOT),
+@st.composite
+def account_strategy_callable(draw, *args, **kwargs):
+    account_code = draw(code)
+    return draw(
+        st.builds(
+            Account,
+            code=st.just(account_code),
+            code_hash=st.just(keccak256(account_code)),
+            **kwargs,
+        )
+    )
+
+
+# Take the EMPTY_TRIE_HASH value by default. This will be built in the state strategy, based on the storage tries.
+account_strategy = code.flatmap(
+    lambda account_code: st.builds(
+        Account,
+        nonce=uint,
+        balance=uint256,
+        code=st.just(account_code),
+        storage_root=st.just(EMPTY_TRIE_HASH),
+        code_hash=st.just(keccak256(account_code)),
+    )
 )
 
 # Fork
@@ -478,8 +528,20 @@ BEACON_ROOTS_CODE = bytes.fromhex(
 )
 
 # Create the special accounts
-SYSTEM_ACCOUNT = Account(balance=U256(0), nonce=Uint(0), code=bytes())
-BEACON_ROOTS_ACCOUNT = Account(balance=U256(0), nonce=Uint(1), code=BEACON_ROOTS_CODE)
+SYSTEM_ACCOUNT = Account(
+    balance=U256(0),
+    nonce=Uint(0),
+    code=bytes(),
+    storage_root=EMPTY_TRIE_HASH,
+    code_hash=EMPTY_BYTES_HASH,
+)
+BEACON_ROOTS_ACCOUNT = Account(
+    balance=U256(0),
+    nonce=Uint(1),
+    code=BEACON_ROOTS_CODE,
+    storage_root=EMPTY_TRIE_HASH,
+    code_hash=keccak256(BEACON_ROOTS_CODE),
+)
 
 
 @st.composite
@@ -508,9 +570,9 @@ def state_strategy(draw):
             _data=st.fixed_dictionaries(
                 {
                     address: (
-                        st.builds(
-                            Account,
-                            storage_root=st.just(compute_root(_storage_tries[address])),
+                        # Note: calling st.builds(Account) here would generate a wrong codehash - so I explicitly call a callable strategy.
+                        account_strategy_callable(
+                            storage_root=st.just(compute_root(_storage_tries[address]))
                         )
                         if address in _storage_tries.keys()
                         else account_strategy
@@ -634,6 +696,8 @@ bnp2_strategy = st.integers(min_value=0, max_value=BNF2.PRIME - 1).map(
     lambda x: bnp2_generate_valid_point(x)
 )
 
+bytes48 = st.binary(min_size=48, max_size=48).map(Bytes48)
+
 
 def register_type_strategies():
     st.register_type_strategy(U64, uint64)
@@ -686,8 +750,17 @@ def register_type_strategies():
         st.fixed_dictionaries(
             {
                 "key_segment": nibble,
-                "subnode": st.integers(min_value=0, max_value=2**256 - 1).map(
-                    lambda x: x.to_bytes(32, "little")
+                "subnode": st.one_of(
+                    st.integers(min_value=0, max_value=2**256 - 1).map(
+                        lambda x: x.to_bytes(32, "little")
+                    ),
+                    # Always work with list instead of tuples for consistency
+                    st.from_type(LeafNode)
+                    .map(lambda x: encode_internal_node(x))
+                    .map(lambda x: list(x) if isinstance(x, tuple) else x),
+                    st.from_type(BranchNode)
+                    .map(lambda x: encode_internal_node(x))
+                    .map(lambda x: list(x) if isinstance(x, tuple) else x),
                 ),
             }
         ).map(lambda x: ExtensionNode(**x)),
@@ -698,8 +771,16 @@ def register_type_strategies():
             {
                 # 16 subnodes of 32 bytes each
                 "subnodes": st.lists(
-                    st.integers(min_value=0, max_value=2**256 - 1).map(
-                        lambda x: x.to_bytes(32, "little")
+                    st.one_of(
+                        st.integers(min_value=0, max_value=2**256 - 1).map(
+                            lambda x: x.to_bytes(32, "little")
+                        ),
+                        st.from_type(LeafNode)
+                        .map(lambda x: encode_internal_node(x))
+                        .map(lambda x: list(x) if isinstance(x, tuple) else x),
+                        st.from_type(ExtensionNode)
+                        .map(lambda x: encode_internal_node(x))
+                        .map(lambda x: list(x) if isinstance(x, tuple) else x),
                     ),
                     min_size=16,
                     max_size=16,
@@ -732,3 +813,7 @@ def register_type_strategies():
     st.register_type_strategy(BNF, bnf_strategy)
     st.register_type_strategy(BNP, bnp_strategy)
     st.register_type_strategy(BNP2, bnp2_strategy)
+    st.register_type_strategy(BLSF, blsf_strategy)
+    st.register_type_strategy(BLSF2, blsf2_strategy)
+    st.register_type_strategy(KZGCommitment, bytes48.map(KZGCommitment))
+    st.register_type_strategy(Bytes48, bytes48)
